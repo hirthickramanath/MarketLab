@@ -1,0 +1,87 @@
+-- Production schema foundation. Not used by the local SQLite demo.
+begin;
+-- gen_random_uuid() is built into supported PostgreSQL versions.
+create table public.profiles(id uuid primary key references auth.users(id) on delete cascade, display_name text not null, created_at timestamptz not null default now());
+create table public.user_roles(user_id uuid primary key references public.profiles(id),role text not null check(role in ('student','instructor','admin')));
+create function public.is_admin() returns boolean language sql stable security definer set search_path=public as $$ select exists(select 1 from user_roles where user_id=auth.uid() and role='admin'); $$;
+create table public.classrooms(id uuid primary key default gen_random_uuid(),owner_id uuid not null references profiles(id),name text not null,invite_hash text unique,created_at timestamptz not null default now());
+create table public.classroom_memberships(classroom_id uuid references classrooms(id),user_id uuid references profiles(id),primary key(classroom_id,user_id));
+create table public.exchanges(id text primary key,name text not null,country text not null,timezone text not null,currency char(3) not null);
+create table public.instruments(id uuid primary key default gen_random_uuid(),exchange_id text not null references exchanges(id),symbol text not null,name text not null,currency char(3) not null,sector text,instrument_type text not null default 'equity',unique(exchange_id,symbol));
+create table public.trading_sessions(id uuid primary key default gen_random_uuid(),user_id uuid not null references profiles(id),classroom_id uuid references classrooms(id),started_at timestamptz not null default now(),expires_at timestamptz not null,starting_capital numeric(20,4) not null check(starting_capital>0),currency char(3) not null,status text not null check(status in('active','completed')),mode text not null check(mode in('replay','delayed','live','illustrative')),news_cutoff timestamptz not null,check(expires_at>started_at));
+create table public.virtual_accounts(id uuid primary key default gen_random_uuid(),user_id uuid not null references profiles(id),session_id uuid unique references trading_sessions(id),currency char(3) not null,cash numeric(20,4) not null default 0 check(cash>=0),reserved_cash numeric(20,4) not null default 0 check(reserved_cash>=0 and reserved_cash<=cash));
+create table public.wallet_ledger(id uuid primary key default gen_random_uuid(),account_id uuid not null references virtual_accounts(id),amount numeric(20,4) not null,reason text not null,idempotency_key text unique not null,created_at timestamptz not null default now(),actor_id uuid references profiles(id));
+create table public.instrument_prices(id bigint generated always as identity primary key,instrument_id uuid not null references instruments(id),observed_at timestamptz not null,price numeric(20,6) not null check(price>0),provider text not null,mode text not null,unique(instrument_id,observed_at,provider));
+create table public.historical_ohlcv(instrument_id uuid references instruments(id),observed_at timestamptz,open numeric(20,6) not null,high numeric(20,6) not null,low numeric(20,6) not null,close numeric(20,6) not null,volume numeric(24,4),provider text not null,primary key(instrument_id,observed_at),check(low<=open and low<=close and high>=open and high>=close));
+create table public.corporate_actions(id uuid primary key default gen_random_uuid(),instrument_id uuid not null references instruments(id),effective_at timestamptz not null,kind text not null,payload jsonb not null);
+create table public.orders(id uuid primary key default gen_random_uuid(),account_id uuid not null references virtual_accounts(id),instrument_id uuid not null references instruments(id),side text not null check(side in('buy','sell')),kind text not null check(kind in('market','limit')),quantity numeric(20,6) not null check(quantity>0),limit_price numeric(20,6),status text not null check(status in('pending','filled','cancelled','rejected')),idempotency_key text unique not null,hypothesis text not null,created_at timestamptz not null default now(),check(kind<>'limit' or limit_price>0));
+create table public.order_executions(id uuid primary key default gen_random_uuid(),order_id uuid not null references orders(id),quantity numeric(20,6) not null check(quantity>0),price numeric(20,6) not null check(price>0),fee numeric(20,4) not null check(fee>=0),price_id bigint references instrument_prices(id),methodology text not null,created_at timestamptz not null default now());
+create table public.positions(account_id uuid references virtual_accounts(id),instrument_id uuid references instruments(id),quantity numeric(20,6) not null check(quantity>=0),cost_basis numeric(20,4) not null check(cost_basis>=0),primary key(account_id,instrument_id));
+create table public.position_lots(id uuid primary key default gen_random_uuid(),account_id uuid not null references virtual_accounts(id),instrument_id uuid not null references instruments(id),execution_id uuid not null references order_executions(id),remaining_quantity numeric(20,6) not null check(remaining_quantity>=0),cost_basis numeric(20,4) not null);
+create table public.portfolio_valuations(account_id uuid references virtual_accounts(id),observed_at timestamptz not null,equity numeric(20,4) not null,net_funding numeric(20,4) not null,primary key(account_id,observed_at));
+create table public.news_sources(id uuid primary key default gen_random_uuid(),name text not null,homepage text not null,license text not null);
+create table public.market_news(id uuid primary key default gen_random_uuid(),source_id uuid references news_sources(id),headline text not null,url text unique not null,published_at timestamptz not null,ingested_at timestamptz not null default now(),licensed_excerpt text,ai_summary text,region text not null,fingerprint text unique not null,illustrative boolean not null default false);
+create table public.news_instrument_links(news_id uuid references market_news(id),instrument_id uuid references instruments(id),primary key(news_id,instrument_id));
+create table public.session_news_snapshots(session_id uuid references trading_sessions(id),news_id uuid references market_news(id),available_at timestamptz not null,payload jsonb not null,primary key(session_id,news_id));
+create table public.session_instruments(session_id uuid references trading_sessions(id),instrument_id uuid references instruments(id),primary key(session_id,instrument_id));
+create table public.session_orders(session_id uuid references trading_sessions(id),order_id uuid unique references orders(id),primary key(session_id,order_id));
+create table public.session_equity_snapshots(session_id uuid references trading_sessions(id),observed_at timestamptz,equity numeric(20,4) not null,primary key(session_id,observed_at));
+create table public.session_reports(session_id uuid primary key references trading_sessions(id),created_at timestamptz not null default now(),report jsonb not null);
+create table public.watchlists(id uuid primary key default gen_random_uuid(),user_id uuid not null references profiles(id),name text not null);
+create table public.watchlist_items(watchlist_id uuid references watchlists(id),instrument_id uuid references instruments(id),primary key(watchlist_id,instrument_id));
+create table public.investment_journal_entries(id uuid primary key default gen_random_uuid(),user_id uuid not null references profiles(id),session_id uuid references trading_sessions(id),order_id uuid references orders(id),hypothesis text not null,risks text,confidence smallint check(confidence between 0 and 100),created_at timestamptz not null default now());
+create table public.learning_modules(id uuid primary key default gen_random_uuid(),level smallint unique not null,title text not null);
+create table public.lessons(id uuid primary key default gen_random_uuid(),module_id uuid references learning_modules(id),title text not null,content jsonb not null);
+create table public.quizzes(id uuid primary key default gen_random_uuid(),lesson_id uuid references lessons(id),question text not null,options jsonb not null);
+-- Answers are deliberately isolated in a table with no student SELECT policy.
+create table public.quiz_answers(quiz_id uuid primary key references quizzes(id),correct_answer int not null);
+create table public.quiz_attempts(id uuid primary key default gen_random_uuid(),user_id uuid not null references profiles(id),quiz_id uuid references quizzes(id),answer int not null,passed boolean not null,created_at timestamptz not null default now());
+create table public.achievements(id uuid primary key default gen_random_uuid(),user_id uuid not null references profiles(id),achievement_key text not null,earned_at timestamptz not null default now(),unique(user_id,achievement_key));
+create table public.news_notifications(id uuid primary key default gen_random_uuid(),user_id uuid not null references profiles(id),news_id uuid references market_news(id),dedupe_key text not null,read_at timestamptz,created_at timestamptz not null default now(),unique(user_id,dedupe_key));
+create table public.admin_audit_logs(id uuid primary key default gen_random_uuid(),actor_id uuid not null references profiles(id),target_id uuid references profiles(id),action text not null,reason text not null,created_at timestamptz not null default now());
+create index orders_account_status on orders(account_id,status);
+create index session_user_expiry on trading_sessions(user_id,expires_at);
+create index ledger_account_time on wallet_ledger(account_id,created_at);
+create index news_publication on market_news(published_at);
+-- Default deny all client mutation of financial, privilege and ingestion tables.
+do $$ declare t record;begin for t in select tablename from pg_tables where schemaname='public' loop execute format('alter table public.%I enable row level security',t.tablename);end loop;end $$;
+create policy profile_read on profiles for select using(id=auth.uid() or is_admin());
+create policy profile_update on profiles for update using(id=auth.uid()) with check(id=auth.uid());
+create policy role_read on user_roles for select using(user_id=auth.uid() or is_admin());
+create policy accounts_read on virtual_accounts for select using(user_id=auth.uid() or is_admin());
+create policy sessions_read on trading_sessions for select using(user_id=auth.uid() or is_admin());
+create policy ledger_read on wallet_ledger for select using(exists(select 1 from virtual_accounts a where a.id=account_id and (a.user_id=auth.uid() or is_admin())));
+create policy orders_read on orders for select using(exists(select 1 from virtual_accounts a where a.id=account_id and (a.user_id=auth.uid() or is_admin())));
+create policy positions_read on positions for select using(exists(select 1 from virtual_accounts a where a.id=account_id and (a.user_id=auth.uid() or is_admin())));
+create policy executions_read on order_executions for select using(exists(select 1 from orders o join virtual_accounts a on a.id=o.account_id where o.id=order_id and (a.user_id=auth.uid() or is_admin())));
+do $$ declare t text;begin foreach t in array array['exchanges','instruments','instrument_prices','historical_ohlcv','corporate_actions','news_sources','market_news','news_instrument_links','learning_modules','lessons','quizzes'] loop execute format('create policy authenticated_read on public.%I for select to authenticated using (true)',t);end loop; foreach t in array array['watchlists','investment_journal_entries','quiz_attempts','achievements','news_notifications'] loop execute format('create policy owner_read on public.%I for select using(user_id=auth.uid() or is_admin())',t);end loop;end $$;
+create policy watchlists_write on watchlists for all using(user_id=auth.uid()) with check(user_id=auth.uid());
+create policy journal_write on investment_journal_entries for insert with check(user_id=auth.uid() and (session_id is null or exists(select 1 from trading_sessions s where s.id=session_id and s.user_id=auth.uid())) and (order_id is null or exists(select 1 from orders o join virtual_accounts a on a.id=o.account_id where o.id=order_id and a.user_id=auth.uid())));
+create policy watch_items on watchlist_items for all using(exists(select 1 from watchlists w where w.id=watchlist_id and w.user_id=auth.uid())) with check(exists(select 1 from watchlists w where w.id=watchlist_id and w.user_id=auth.uid()));
+do $$ declare t text;begin foreach t in array array['session_news_snapshots','session_instruments','session_orders','session_equity_snapshots','session_reports'] loop execute format('create policy session_read on public.%I for select using(exists(select 1 from trading_sessions s where s.id=session_id and (s.user_id=auth.uid() or is_admin())))',t);end loop;end $$;
+create policy classrooms_read on classrooms for select using(owner_id=auth.uid() or is_admin());
+create policy memberships_read on classroom_memberships for select using(user_id=auth.uid() or is_admin());
+create policy audit_read on admin_audit_logs for select using(is_admin());
+-- Funding RPC: only authenticated administrators, row lock, append-only audit.
+create function public.credit_virtual_account(p_account uuid,p_amount numeric,p_reason text,p_key text) returns void language plpgsql security definer set search_path=public as $$ declare a virtual_accounts;begin
+ if not is_admin() then raise exception 'admin required';end if;
+ if p_amount<=0 or length(trim(p_reason))<10 then raise exception 'invalid credit';end if;
+ select * into a from virtual_accounts where id=p_account for update;
+ if not found or a.session_id is not null then raise exception 'practice account required';end if;
+ if exists(select 1 from wallet_ledger where idempotency_key=p_key) then return;end if;
+ insert into wallet_ledger(account_id,amount,reason,idempotency_key,actor_id) values(p_account,p_amount,p_reason,p_key,auth.uid());
+ update virtual_accounts set cash=cash+p_amount where id=p_account;
+ insert into admin_audit_logs(actor_id,target_id,action,reason) values(auth.uid(),a.user_id,'wallet_credit',p_reason);
+ end $$;
+revoke all on function public.credit_virtual_account(uuid,numeric,text,text) from public;
+grant execute on function public.credit_virtual_account(uuid,numeric,text,text) to authenticated;
+grant usage on schema public to authenticated;
+grant select,insert,update,delete on all tables in schema public to authenticated;
+create function public.reject_ledger_mutation() returns trigger language plpgsql as $$ begin raise exception 'append-only record';end $$;
+create trigger ledger_append_only before update or delete on wallet_ledger for each row execute function reject_ledger_mutation();
+create trigger audit_append_only before update or delete on admin_audit_logs for each row execute function reject_ledger_mutation();
+create trigger frozen_news before update or delete on session_news_snapshots for each row execute function reject_ledger_mutation();
+create function public.protect_session_contract() returns trigger language plpgsql as $$ begin
+ if new.starting_capital<>old.starting_capital or new.started_at<>old.started_at or new.expires_at<>old.expires_at or new.currency<>old.currency or new.news_cutoff<>old.news_cutoff or new.user_id<>old.user_id then raise exception 'immutable session contract';end if;return new;end $$;
+create trigger session_contract before update on trading_sessions for each row execute function protect_session_contract();
+commit;
